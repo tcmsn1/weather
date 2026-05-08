@@ -1,0 +1,29 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 本地配置（勿提交密码）
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 本地数据库（若曾用 SQLite）
+*.db
+
+# 系统
+.DS_Store
+Thumbs.db

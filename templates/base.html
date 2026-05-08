@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}云感天气 · 预报与我的气象站{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+  {% block head_extra %}{% endblock %}
+</head>
+<body>
+  <div class="wrap">
+    <nav class="nav">
+      <a class="nav-brand" href="{{ url_for('index') }}">
+        <span class="icon">☁</span>
+        云感天气
+      </a>
+      <div class="nav-links">
+        <a href="{{ url_for('index') }}">首页</a>
+        {% if session.get('user_id') %}
+        <span class="nav-user">你好，<strong>{{ session.get('username', '') }}</strong></span>
+        <a href="{{ url_for('logout') }}">退出</a>
+        {% else %}
+        <a href="{{ url_for('login') }}">登录</a>
+        <a class="btn-nav" href="{{ url_for('register') }}">注册</a>
+        {% endif %}
+      </div>
+    </nav>
+
+    {% block content %}{% endblock %}
+
+    <footer style="margin-top:2.5rem;text-align:center;font-size:0.78rem;color:rgba(255,255,255,0.7);">
+      区域预报数据由
+      <a href="https://open-meteo.com/" target="_blank" rel="noopener noreferrer" style="color:#bae6fd;">Open-Meteo</a>
+      提供（免费接口）· 物联网数据来自你的设备上报
+    </footer>
+  </div>
+</body>
+</html>

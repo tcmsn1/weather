@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}{{ device['name'] }} — 云感天气{% endblock %}
+
+{% block head_extra %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="device-page">
+  <h1>{{ device['name'] }}</h1>
+  <p class="lead">设备 ID <strong>{{ device['id'] }}</strong> · <a href="{{ url_for('index') }}" style="color:#fff;">← 返回首页</a></p>
+
+  <div class="card">
+    <h2 style="margin-top:0;">连接信息</h2>
+    <p>HTTP 上报字段 <code style="background:#e2e8f0;padding:0.15rem 0.4rem;border-radius:0.35rem;">device_token</code></p>
+    <p><code style="background:#e2e8f0;padding:0.2rem 0.45rem;border-radius:0.35rem;word-break:break-all;">{{ device['token'] }}</code></p>
+    <p class="hint" style="margin-bottom:0;">MQTT（需 <code>MQTT_ENABLE=1</code>）主题：<code>weather/{{ device['token'] }}/data</code></p>
+  </div>
+
+  {% if stats %}
+  <div class="card">
+    <h2 style="margin-top:0;">累计统计</h2>
+    <div class="stats">
+      <div class="stat">记录条数<strong>{{ stats['n'] }}</strong></div>
+      <div class="stat">温度均值 °C<strong>{{ '%.2f'|format(stats['avg_t']) if stats['avg_t'] is not none else '—' }}</strong></div>
+      <div class="stat">温度最低<strong>{{ '%.2f'|format(stats['min_t']) if stats['min_t'] is not none else '—' }}</strong></div>
+      <div class="stat">温度最高<strong>{{ '%.2f'|format(stats['max_t']) if stats['max_t'] is not none else '—' }}</strong></div>
+      <div class="stat">湿度均值 %<strong>{{ '%.1f'|format(stats['avg_h']) if stats['avg_h'] is not none else '—' }}</strong></div>
+      <div class="stat">气压均值 hPa<strong>{{ '%.1f'|format(stats['avg_p']) if stats['avg_p'] is not none else '—' }}</strong></div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <h2 style="margin-top:0;">重命名</h2>
+    <div class="inline-form">
+      <input type="text" id="newName" value="{{ device['name'] }}" />
+      <button type="button" onclick="renameDev()">保存</button>
+    </div>
+    <pre id="renameOut" class="hint" style="white-space:pre-wrap;"></pre>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0;">最近读数曲线</h2>
+    <p class="hint">最多 120 条。无数据时不绘图。</p>
+    <canvas id="chart"></canvas>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0;">导出</h2>
+    <p class="hint" style="margin:0;">
+      <a href="/api/devices/{{ device['id'] }}/export.csv?limit=5000" download>下载 CSV</a>
+      （默认最多 5000 行，参数 limit 最大 20000）
+    </p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0;">删除设备</h2>
+    <p class="hint">将删除该设备全部历史读数。</p>
+    <button type="button" class="secondary" onclick="deleteDev()">删除此设备</button>
+    <pre id="delOut" class="hint" style="white-space:pre-wrap;"></pre>
+  </div>
+</div>
+
+<script>
+  const deviceId = {{ device['id'] }};
+
+  async function renameDev() {
+    const name = document.getElementById('newName').value.trim();
+    const res = await fetch('/api/devices/' + deviceId, {
+      method: 'PATCH',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    document.getElementById('renameOut').textContent = JSON.stringify(data, null, 2);
+    if (res.ok) location.reload();
+  }
+
+  async function deleteDev() {
+    if (!confirm('确定删除该设备及全部历史数据？不可恢复。')) return;
+    const res = await fetch('/api/devices/' + deviceId, {
+      method: 'DELETE',
+      credentials: 'same-origin',
+    });
+    const data = await res.json();
+    document.getElementById('delOut').textContent = JSON.stringify(data, null, 2);
+    if (res.ok) location.href = '/';
+  }
+
+  (async function loadChart() {
+    const res = await fetch('/api/devices/' + deviceId + '/readings?limit=120', {
+      credentials: 'same-origin',
+    });
+    const rows = await res.json();
+    if (!rows.length) return;
+    rows.reverse();
+    const labels = rows.map(r => (r.ts || '').replace('T', ' ').slice(0, 19));
+    const tData = rows.map(r => r.temperature);
+    const hData = rows.map(r => r.humidity);
+    const pData = rows.map(r => r.pressure);
+    const ctx = document.getElementById('chart');
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          { label: '温度 °C', data: tData, borderColor: '#c62828', tension: 0.2, yAxisID: 'y' },
+          { label: '湿度 %', data: hData, borderColor: '#1565c0', tension: 0.2, yAxisID: 'y' },
+          { label: '气压 hPa', data: pData, borderColor: '#2e7d32', tension: 0.2, yAxisID: 'y1' },
+        ],
+      },
+      options: {
+        responsive: true,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          x: { ticks: { maxRotation: 45, minRotation: 0 } },
+          y: { position: 'left', title: { display: true, text: '温度 / 湿度' } },
+          y1: {
+            position: 'right',
+            grid: { drawOnChartArea: false },
+            title: { display: true, text: '气压' },
+          },
+        },
+      },
+    });
+  })();
+</script>
+{% endblock %}

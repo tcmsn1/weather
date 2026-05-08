@@ -1,0 +1,300 @@
+{% extends "base.html" %}
+{% block title %}云感天气 · 预报与我的气象站{% endblock %}
+
+{% block content %}
+<section class="section-head">
+  <div>
+    <h2>区域天气预报</h2>
+    <p>搜索全球城市，数据来自 Open-Meteo（免费接口，适合课设演示）</p>
+  </div>
+</section>
+
+<div class="card card-soft">
+  <p style="margin:0 0 0.75rem;font-size:0.9rem;color:var(--muted);">试试快捷城市：</p>
+  <div class="chips" id="quickCities">
+    <button type="button" data-lat="39.9042" data-lon="116.4074" data-label="北京">北京</button>
+    <button type="button" data-lat="31.2304" data-lon="121.4737" data-label="上海">上海</button>
+    <button type="button" data-lat="23.1291" data-lon="113.2644" data-label="广州">广州</button>
+    <button type="button" data-lat="22.5431" data-lon="114.0579" data-label="深圳">深圳</button>
+    <button type="button" data-lat="30.2741" data-lon="120.1551" data-label="杭州">杭州</button>
+    <button type="button" data-lat="30.5728" data-lon="104.0668" data-label="成都">成都</button>
+  </div>
+  <div class="ac-box">
+    <div class="search-row">
+      <input type="search" id="citySearch" placeholder="输入城市名，例如：青岛、London、東京" autocomplete="off" />
+      <button type="button" id="btnSearch">搜索地点</button>
+    </div>
+    <div class="ac-list" id="acList"></div>
+  </div>
+  <p id="wxErr" class="err" style="display:none;margin-top:0.5rem;"></p>
+</div>
+
+<div class="forecast-hero" style="margin-top:1rem;">
+  <div class="hero-main" id="heroCard">
+    <div class="hero-location" id="heroLoc">请选择城市或点击上方快捷城市</div>
+    <div class="hero-temp" id="heroTemp">—<small>°C</small></div>
+    <p class="hero-desc" id="heroDesc">实况与 7 日概况将显示在这里</p>
+    <div class="hero-meta" id="heroMeta"></div>
+  </div>
+  <div class="card" style="margin:0;">
+    <h3 style="margin:0 0 0.75rem;font-size:1rem;">未来 7 天</h3>
+    <div class="daily-strip" id="dailyStrip"></div>
+  </div>
+</div>
+
+<section class="section-head">
+  <div>
+    <h2>我的气象站</h2>
+    <p>物联网设备上报后，在此以卡片展示你的实况数据</p>
+  </div>
+</section>
+
+{% if logged_in %}
+<div class="card" style="margin-bottom:1rem;">
+  <h3 style="margin:0 0 0.5rem;font-size:1rem;">添加设备</h3>
+  <div class="inline-form">
+    <input type="text" id="devName" placeholder="例如：阳台气象站" />
+    <button type="button" id="btnAddDev">注册设备</button>
+  </div>
+  <pre id="regOut" class="hint" style="white-space:pre-wrap;margin-top:0.5rem;"></pre>
+</div>
+
+{% if devices|length == 0 %}
+<div class="iot-empty">
+  还没有设备。注册后把返回的 <strong>token</strong> 写入硬件，向 <code>/api/ingest</code> 上报即可在此显示卡片。
+</div>
+{% else %}
+<div class="iot-grid">
+  {% for d in devices %}
+  {% set r = latest.get(d['id']) %}
+  <a class="iot-card" href="{{ url_for('device_detail', device_id=d['id']) }}">
+    <span class="badge">我的设备</span>
+    <h3>{{ d['name'] }}</h3>
+    {% if r and r.get('temperature') is not none %}
+    <div class="big-t">{{ '%.1f'|format(r['temperature']) }}°</div>
+    <div class="row-metrics">
+      <span>湿度 {{ r['humidity'] if r['humidity'] is not none else '—' }}%</span>
+      <span>气压 {{ r['pressure'] if r['pressure'] is not none else '—' }}</span>
+    </div>
+    <div class="sub">{{ r['ts'] }} · {{ r['source'] or '—' }}</div>
+    {% else %}
+    <div class="big-t">—°</div>
+    <div class="sub">尚无上报数据，请检查硬件或 token</div>
+    {% endif %}
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% else %}
+<div class="iot-empty">
+  <p style="margin:0 0 1rem;">登录后可注册设备、查看<strong>个人气象卡片</strong>与历史曲线。</p>
+  <a href="{{ url_for('login') }}">去登录</a>
+  &nbsp;·&nbsp;
+  <a href="{{ url_for('register') }}">注册账号</a>
+</div>
+{% endif %}
+
+<section class="section-head">
+  <div>
+    <h2>硬件上报示例</h2>
+    <p>设备无需浏览器登录，使用注册时获得的 token</p>
+  </div>
+</section>
+<div class="card">
+<pre class="code">curl -X POST http://127.0.0.1:5000/api/ingest ^
+  -H "Content-Type: application/json" ^
+  -d "{\"device_token\":\"YOUR_TOKEN\",\"temperature\":23.5,\"humidity\":60,\"pressure\":1012}"</pre>
+</div>
+
+<script>
+(function () {
+  const acList = document.getElementById('acList');
+  const citySearch = document.getElementById('citySearch');
+  const wxErr = document.getElementById('wxErr');
+  let selected = null;
+
+  function showErr(msg) {
+    wxErr.style.display = msg ? 'block' : 'none';
+    wxErr.textContent = msg || '';
+  }
+
+  function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  async function loadForecast(lat, lon, label) {
+    showErr('');
+    selected = { lat, lon, label };
+    document.getElementById('heroLoc').textContent = label;
+    document.getElementById('heroTemp').innerHTML = '…<small>°C</small>';
+    document.getElementById('heroDesc').textContent = '加载中…';
+    document.getElementById('heroMeta').innerHTML = '';
+    document.getElementById('dailyStrip').innerHTML = '';
+    try {
+      const res = await fetch('/api/weather/current?lat=' + lat + '&lon=' + lon);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '请求失败');
+      const c = data.current || {};
+      const t = c.temperature_2m;
+      document.getElementById('heroTemp').innerHTML =
+        (t != null ? Number(t).toFixed(1) : '—') + '<small>°C</small>';
+      document.getElementById('heroDesc').textContent = c.weather_zh || '—';
+
+      const meta = document.getElementById('heroMeta');
+      const items = [
+        ['湿度', (c.relative_humidity_2m != null ? c.relative_humidity_2m + ' %' : '—')],
+        ['气压', (c.surface_pressure != null ? Number(c.surface_pressure).toFixed(0) + ' hPa' : '—')],
+        ['风速', (c.wind_speed_10m != null ? Number(c.wind_speed_10m).toFixed(1) + ' m/s' : '—')],
+        ['风向', (c.wind_direction_10m != null ? c.wind_direction_10m + '°' : '—')],
+        ['观测时间', (c.time || '—').replace('T', ' ').slice(0, 16)],
+      ];
+      meta.innerHTML = items
+        .map(
+          ([k, v]) =>
+            '<div class="meta-item"><span>' +
+            esc(k) +
+            '</span><strong>' +
+            esc(String(v)) +
+            '</strong></div>'
+        )
+        .join('');
+
+      const strip = document.getElementById('dailyStrip');
+      strip.innerHTML = (data.daily || [])
+        .map(function (d) {
+          const hi = d.tmax != null ? Number(d.tmax).toFixed(0) : '—';
+          const lo = d.tmin != null ? Number(d.tmin).toFixed(0) : '—';
+          const day = (d.date || '').slice(5);
+          return (
+            '<div class="daily-cell"><div class="d">' +
+            esc(day) +
+            '</div><div class="hi">' +
+            esc(hi) +
+            '°</div><div class="lo">' +
+            esc(lo) +
+            '°</div><div style="font-size:0.7rem;color:#64748b;margin-top:0.25rem;">' +
+            esc(d.label_zh || '') +
+            '</div></div>'
+          );
+        })
+        .join('');
+    } catch (e) {
+      showErr(e.message || String(e));
+      document.getElementById('heroDesc').textContent = '加载失败';
+    }
+  }
+
+  let debounce;
+  citySearch.addEventListener('input', function () {
+    clearTimeout(debounce);
+    const q = citySearch.value.trim();
+    if (q.length < 2) {
+      acList.classList.remove('open');
+      acList.innerHTML = '';
+      return;
+    }
+    debounce = setTimeout(async function () {
+      try {
+        const res = await fetch('/api/weather/search?q=' + encodeURIComponent(q));
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '搜索失败');
+        const results = data.results || [];
+        if (!results.length) {
+          acList.innerHTML = '<div class="ac-item">无匹配地点</div>';
+        } else {
+          acList.innerHTML = results
+            .map(function (r, i) {
+              return (
+                '<div class="ac-item" data-i="' +
+                i +
+                '" data-lat="' +
+                r.latitude +
+                '" data-lon="' +
+                r.longitude +
+                '">' +
+                esc(r.label || r.name) +
+                '</div>'
+              );
+            })
+            .join('');
+          acList._results = results;
+        }
+        acList.classList.add('open');
+      } catch (e) {
+        acList.innerHTML =
+          '<div class="ac-item">' + esc(e.message || String(e)) + '</div>';
+        acList.classList.add('open');
+      }
+    }, 280);
+  });
+
+  acList.addEventListener('click', function (ev) {
+    const el = ev.target.closest('.ac-item');
+    if (!el || el.dataset.lat == null) return;
+    const lat = parseFloat(el.dataset.lat);
+    const lon = parseFloat(el.dataset.lon);
+    const i = parseInt(el.dataset.i, 10);
+    const r = acList._results && acList._results[i];
+    const label = r ? r.label || r.name : citySearch.value;
+    citySearch.value = label;
+    acList.classList.remove('open');
+    loadForecast(lat, lon, label);
+  });
+
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest('.ac-box')) acList.classList.remove('open');
+  });
+
+  document.getElementById('btnSearch').addEventListener('click', async function () {
+    const q = citySearch.value.trim();
+    if (!q) return;
+    showErr('');
+    try {
+      const res = await fetch('/api/weather/search?q=' + encodeURIComponent(q));
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '搜索失败');
+      const results = data.results || [];
+      if (!results.length) {
+        showErr('未找到地点，请换关键词');
+        return;
+      }
+      const r = results[0];
+      loadForecast(r.latitude, r.longitude, r.label || r.name);
+    } catch (e) {
+      showErr(e.message || String(e));
+    }
+  });
+
+  document.getElementById('quickCities').addEventListener('click', function (ev) {
+    const b = ev.target.closest('button[data-lat]');
+    if (!b) return;
+    loadForecast(
+      parseFloat(b.dataset.lat),
+      parseFloat(b.dataset.lon),
+      b.dataset.label || b.textContent
+    );
+    citySearch.value = b.dataset.label || b.textContent;
+  });
+
+  loadForecast(39.9042, 116.4074, '北京');
+})();
+
+{% if logged_in %}
+document.getElementById('btnAddDev').addEventListener('click', async function () {
+  const name = document.getElementById('devName').value.trim() || '未命名设备';
+  const res = await fetch('/api/devices', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  const data = await res.json();
+  document.getElementById('regOut').textContent = JSON.stringify(data, null, 2);
+  if (res.ok) location.reload();
+});
+{% endif %}
+</script>
+{% endblock %}
