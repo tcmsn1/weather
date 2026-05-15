@@ -20,7 +20,12 @@
       <div class="nav-links">
         <a href="{{ url_for('index') }}">首页</a>
         {% if session.get('user_id') %}
-        <span class="nav-user">你好，<strong>{{ session.get('username', '') }}</strong></span>
+        <span class="nav-user">
+          你好，<strong>{{ session.get('username', '') }}</strong>
+          {% if session.get('is_admin') %}
+          <span style="margin-left:0.35rem;padding:0.15rem 0.45rem;border-radius:999px;background:#fef3c7;color:#92400e;font-size:0.72rem;font-weight:700;">管理员</span>
+          {% endif %}
+        </span>
         <a href="{{ url_for('logout') }}">退出</a>
         {% else %}
         <a href="{{ url_for('login') }}">登录</a>

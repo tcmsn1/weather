@@ -4,6 +4,8 @@
 - 登录后：管理自有设备，设备数据以「气象卡片」展示；硬件上报仍用 device_token
 
 环境变量：MYSQL_*、SECRET_KEY、MQTT_ENABLE=1（可选）
+  ADMIN_USERNAMES   逗号分隔的用户名，启动时设为管理员（例：admin,teacher）
+
 运行：pip install -r requirements.txt && python app.py
 """
 
@@ -125,6 +127,12 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_ENABLE = os.environ.get("MQTT_ENABLE", "0") == "1"
 MQTT_TOPIC_PATTERN = "weather/+/data"
 
+# 启动时将这些用户名设为管理员（仅提升，不会自动取消他人管理员）
+_admin_names_raw = os.environ.get("ADMIN_USERNAMES", "").strip()
+ADMIN_USERNAMES: frozenset[str] = frozenset(
+    x.strip().lower() for x in _admin_names_raw.split(",") if x.strip()
+)
+
 _db_lock = threading.Lock()
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -190,6 +198,37 @@ def _constraint_exists(cur, table: str, name: str) -> bool:
     return int(cur.fetchone()["c"]) > 0
 
 
+def migrate_users_admin_column() -> None:
+    """users 表增加 is_admin；并按 ADMIN_USERNAMES 提升管理员。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if not _column_exists(cur, "users", "is_admin"):
+                cur.execute(
+                    """
+                    ALTER TABLE users
+                    ADD COLUMN is_admin TINYINT(1) NOT NULL DEFAULT 0
+                    """
+                )
+    if not ADMIN_USERNAMES:
+        return
+    names = tuple(ADMIN_USERNAMES)
+    placeholders = ",".join(["%s"] * len(names))
+    with _db_lock, get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE users SET is_admin = 1 WHERE LOWER(username) IN ({placeholders})",
+                names,
+            )
+            n = cur.rowcount
+    if n:
+        print(f"已根据 ADMIN_USERNAMES 将 {n} 个用户设为管理员（匹配不区分大小写）。")
+    elif _admin_names_raw:
+        print(
+            "警告: 已设置 ADMIN_USERNAMES，但数据库中没有匹配的用户名。"
+            "请先注册对应账号后再启动，或检查拼写。"
+        )
+
+
 def migrate_devices_user_id() -> None:
     """旧库 devices 无 user_id 时：加列、归入占位账号、NOT NULL、外键。"""
     with get_conn() as conn:
@@ -219,8 +258,8 @@ def migrate_devices_user_id() -> None:
             if not row:
                 cur.execute(
                     """
-                    INSERT INTO users (username, password_hash, created_at)
-                    VALUES (%s, %s, %s)
+                    INSERT INTO users (username, password_hash, created_at, is_admin)
+                    VALUES (%s, %s, %s, 0)
                     """,
                     (
                         "__legacy_devices__",
@@ -258,6 +297,7 @@ def init_db() -> None:
             username VARCHAR(64) NOT NULL,
             password_hash VARCHAR(255) NOT NULL,
             created_at DATETIME(6) NOT NULL,
+            is_admin TINYINT(1) NOT NULL DEFAULT 0,
             PRIMARY KEY (id),
             UNIQUE KEY uk_users_username (username)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -293,6 +333,7 @@ def init_db() -> None:
         with conn.cursor() as cur:
             for s in stmts:
                 cur.execute(s.strip())
+    migrate_users_admin_column()
     migrate_devices_user_id()
 
 
@@ -338,6 +379,37 @@ def _device_owned(device_id: int, user_id: int) -> dict[str, Any] | None:
             return cur.fetchone()
 
 
+def _device_for_actor(
+    device_id: int, user_id: int, is_admin: bool
+) -> dict[str, Any] | None:
+    """普通用户仅本人设备；管理员可查任意设备（含 owner_username）。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if is_admin:
+                cur.execute(
+                    """
+                    SELECT d.id, d.name, d.token, d.created_at, d.user_id,
+                           u.username AS owner_username
+                    FROM devices d
+                    JOIN users u ON u.id = d.user_id
+                    WHERE d.id = %s
+                    """,
+                    (device_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT d.id, d.name, d.token, d.created_at, d.user_id,
+                           u.username AS owner_username
+                    FROM devices d
+                    JOIN users u ON u.id = d.user_id
+                    WHERE d.id = %s AND d.user_id = %s
+                    """,
+                    (device_id, user_id),
+                )
+            return cur.fetchone()
+
+
 def _reading_stats(device_id: int) -> dict[str, Any] | None:
     sql = """
         SELECT
@@ -361,6 +433,10 @@ def _reading_stats(device_id: int) -> dict[str, Any] | None:
 def current_user_id() -> int | None:
     uid = session.get("user_id")
     return int(uid) if uid is not None else None
+
+
+def current_is_admin() -> bool:
+    return bool(session.get("is_admin"))
 
 
 def login_required_redirect():
@@ -511,8 +587,8 @@ def register():
                     with conn.cursor() as cur:
                         cur.execute(
                             """
-                            INSERT INTO users (username, password_hash, created_at)
-                            VALUES (%s, %s, %s)
+                            INSERT INTO users (username, password_hash, created_at, is_admin)
+                            VALUES (%s, %s, %s, 0)
                             """,
                             (username, ph, _utc_naive()),
                         )
@@ -520,6 +596,7 @@ def register():
                 session.clear()
                 session["user_id"] = uid
                 session["username"] = username
+                session["is_admin"] = False
                 return redirect(url_for("index"))
             except mysql_err.IntegrityError:
                 err = "用户名已被占用"
@@ -537,7 +614,11 @@ def login():
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, password_hash FROM users WHERE username = %s",
+                    """
+                    SELECT id, password_hash,
+                           COALESCE(is_admin, 0) AS is_admin
+                    FROM users WHERE username = %s
+                    """,
                     (username,),
                 )
                 row = cur.fetchone()
@@ -547,6 +628,7 @@ def login():
             session.clear()
             session["user_id"] = int(row["id"])
             session["username"] = username
+            session["is_admin"] = bool(int(row["is_admin"] or 0))
             nxt = request.form.get("next") or request.args.get("next") or url_for("index")
             if not nxt.startswith("/"):
                 nxt = url_for("index")
@@ -567,18 +649,34 @@ def logout():
 def index():
     """首页公开：区域预报；登录后额外展示个人物联网气象卡片。"""
     uid = current_user_id()
+    is_adm = current_is_admin()
     devices: list[Any] = []
     latest: dict[int, dict | None] = {}
     if uid is not None:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, name, token, created_at
-                    FROM devices WHERE user_id = %s ORDER BY id
-                    """,
-                    (uid,),
-                )
+                if is_adm:
+                    cur.execute(
+                        """
+                        SELECT d.id, d.name, d.token, d.created_at, d.user_id,
+                               u.username AS owner_username
+                        FROM devices d
+                        JOIN users u ON u.id = d.user_id
+                        ORDER BY d.id
+                        """
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT d.id, d.name, d.token, d.created_at, d.user_id,
+                               u.username AS owner_username
+                        FROM devices d
+                        JOIN users u ON u.id = d.user_id
+                        WHERE d.user_id = %s
+                        ORDER BY d.id
+                        """,
+                        (uid,),
+                    )
                 devices = cur.fetchall()
                 for d in devices:
                     cur.execute(
@@ -597,6 +695,7 @@ def index():
         latest=latest,
         username=session.get("username", ""),
         logged_in=uid is not None,
+        is_admin=is_adm,
     )
 
 
@@ -607,11 +706,21 @@ def device_detail(device_id: int):
         return redir
     uid = current_user_id()
     assert uid is not None
-    dev = _device_owned(device_id, uid)
+    is_adm = current_is_admin()
+    dev = _device_for_actor(device_id, uid, is_adm)
     if not dev:
         abort(404)
     stats = _reading_stats(device_id)
-    return render_template("device.html", device=dev, stats=stats)
+    owner = dev.get("owner_username") or ""
+    viewing_others = is_adm and int(dev.get("user_id") or 0) != uid
+    return render_template(
+        "device.html",
+        device=dev,
+        stats=stats,
+        is_admin=is_adm,
+        viewing_others=viewing_others,
+        owner_username=owner,
+    )
 
 
 @app.post("/api/devices")
@@ -641,7 +750,8 @@ def api_patch_device(device_id: int):
     uid = current_user_id()
     if uid is None:
         return jsonify({"error": "请先登录"}), 401
-    if not _device_owned(device_id, uid):
+    is_adm = current_is_admin()
+    if not _device_for_actor(device_id, uid, is_adm):
         return jsonify({"error": "设备不存在"}), 404
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
@@ -649,10 +759,16 @@ def api_patch_device(device_id: int):
         return jsonify({"error": "名称无效或过长"}), 400
     with _db_lock, get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE devices SET name = %s WHERE id = %s AND user_id = %s",
-                (name, device_id, uid),
-            )
+            if is_adm:
+                cur.execute(
+                    "UPDATE devices SET name = %s WHERE id = %s",
+                    (name, device_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE devices SET name = %s WHERE id = %s AND user_id = %s",
+                    (name, device_id, uid),
+                )
     return jsonify({"ok": True, "name": name}), 200
 
 
@@ -661,12 +777,18 @@ def api_delete_device(device_id: int):
     uid = current_user_id()
     if uid is None:
         return jsonify({"error": "请先登录"}), 401
+    is_adm = current_is_admin()
+    if not _device_for_actor(device_id, uid, is_adm):
+        return jsonify({"error": "设备不存在"}), 404
     with _db_lock, get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM devices WHERE id = %s AND user_id = %s",
-                (device_id, uid),
-            )
+            if is_adm:
+                cur.execute("DELETE FROM devices WHERE id = %s", (device_id,))
+            else:
+                cur.execute(
+                    "DELETE FROM devices WHERE id = %s AND user_id = %s",
+                    (device_id, uid),
+                )
             if cur.rowcount == 0:
                 return jsonify({"error": "设备不存在"}), 404
     return jsonify({"ok": True}), 200
@@ -708,17 +830,44 @@ def api_readings(device_id: int):
     uid = current_user_id()
     if uid is None:
         return jsonify({"error": "请先登录"}), 401
-    if not _device_owned(device_id, uid):
+    if not _device_for_actor(device_id, uid, current_is_admin()):
         return jsonify({"error": "设备不存在"}), 404
-    limit = min(int(request.args.get("limit", 200)), 500)
-    sql = """
-        SELECT ts, temperature, humidity, pressure, source
-        FROM readings WHERE device_id = %s
-        ORDER BY id DESC LIMIT %s
-    """
+
+    days_raw = (request.args.get("days") or "").strip()
+    if days_raw:
+        try:
+            days = int(days_raw)
+        except ValueError:
+            return jsonify({"error": "days 须为整数"}), 400
+        if days < 1 or days > 30:
+            return jsonify({"error": "days 须在 1～30 之间"}), 400
+        # 时间窗口内取「最新」若干条，再按时间正序返回，便于画近几日曲线
+        cap = min(int(request.args.get("limit", 2000)), 3000)
+        sql = """
+            SELECT ts, temperature, humidity, pressure, source
+            FROM (
+                SELECT ts, temperature, humidity, pressure, source
+                FROM readings
+                WHERE device_id = %s
+                  AND ts >= DATE_SUB(UTC_TIMESTAMP(6), INTERVAL %s DAY)
+                ORDER BY ts DESC, id DESC
+                LIMIT %s
+            ) AS win
+            ORDER BY ts ASC, id ASC
+        """
+        params: tuple[Any, ...] = (device_id, days, cap)
+    else:
+        cap = min(int(request.args.get("limit", 200)), 500)
+        sql = """
+            SELECT ts, temperature, humidity, pressure, source
+            FROM readings WHERE device_id = %s
+            ORDER BY id DESC LIMIT %s
+        """
+        params = (device_id, cap)
+
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (device_id, limit))
+            cur.execute(sql, params)
             rows = cur.fetchall()
     out = []
     for r in rows:
@@ -735,7 +884,7 @@ def api_export_csv(device_id: int):
     uid = current_user_id()
     if uid is None:
         return jsonify({"error": "请先登录"}), 401
-    if not _device_owned(device_id, uid):
+    if not _device_for_actor(device_id, uid, current_is_admin()):
         return jsonify({"error": "设备不存在"}), 404
     cap = min(int(request.args.get("limit", 5000)), 20000)
     sql = """

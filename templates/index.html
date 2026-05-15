@@ -1,6 +1,10 @@
 {% extends "base.html" %}
 {% block title %}云感天气 · 预报与我的气象站{% endblock %}
 
+{% block head_extra %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+{% endblock %}
+
 {% block content %}
 <section class="section-head">
   <div>
@@ -40,12 +44,25 @@
     <h3 style="margin:0 0 0.75rem;font-size:1rem;">未来 7 天</h3>
     <div class="daily-strip" id="dailyStrip"></div>
   </div>
+  <div class="card" style="margin:1rem 0 0;">
+    <h3 style="margin:0 0 0.35rem;font-size:1rem;">7 天气温曲线</h3>
+    <p class="hint" style="margin:0 0 0.75rem;">横轴为日期，红线为每日最高温、蓝线为每日最低温（预报数据）。</p>
+    <div style="position:relative;height:min(260px,42vh);">
+      <canvas id="forecastTempChart" aria-label="未来七天气温折线图"></canvas>
+    </div>
+  </div>
 </div>
 
 <section class="section-head">
   <div>
-    <h2>我的气象站</h2>
-    <p>物联网设备上报后，在此以卡片展示你的实况数据</p>
+    <h2>{% if is_admin %}全站设备（管理员）{% else %}我的气象站{% endif %}</h2>
+    <p>
+      {% if is_admin %}
+      可查看所有用户注册的物联网设备及最新一条上报数据。
+      {% else %}
+      物联网设备上报后，在此以卡片展示你的实况数据。
+      {% endif %}
+    </p>
   </div>
 </section>
 
@@ -61,14 +78,18 @@
 
 {% if devices|length == 0 %}
 <div class="iot-empty">
+  {% if is_admin %}
+  当前全站还没有任何设备。
+  {% else %}
   还没有设备。注册后把返回的 <strong>token</strong> 写入硬件，向 <code>/api/ingest</code> 上报即可在此显示卡片。
+  {% endif %}
 </div>
 {% else %}
 <div class="iot-grid">
   {% for d in devices %}
   {% set r = latest.get(d['id']) %}
   <a class="iot-card" href="{{ url_for('device_detail', device_id=d['id']) }}">
-    <span class="badge">我的设备</span>
+    <span class="badge">{% if is_admin %}用户 {{ d.get('owner_username', '—') }}{% else %}我的设备{% endif %}</span>
     <h3>{{ d['name'] }}</h3>
     {% if r and r.get('temperature') is not none %}
     <div class="big-t">{{ '%.1f'|format(r['temperature']) }}°</div>
@@ -113,6 +134,7 @@
   const citySearch = document.getElementById('citySearch');
   const wxErr = document.getElementById('wxErr');
   let selected = null;
+  let forecastChart = null;
 
   function showErr(msg) {
     wxErr.style.display = msg ? 'block' : 'none';
@@ -133,6 +155,10 @@
     document.getElementById('heroDesc').textContent = '加载中…';
     document.getElementById('heroMeta').innerHTML = '';
     document.getElementById('dailyStrip').innerHTML = '';
+    if (forecastChart) {
+      forecastChart.destroy();
+      forecastChart = null;
+    }
     try {
       const res = await fetch('/api/weather/current?lat=' + lat + '&lon=' + lon);
       const data = await res.json();
@@ -181,6 +207,82 @@
           );
         })
         .join('');
+
+      const daily = data.daily || [];
+      const fcCanvas = document.getElementById('forecastTempChart');
+      if (fcCanvas && typeof Chart !== 'undefined' && daily.length) {
+        const labels = daily.map(function (d) {
+          const s = d.date || '';
+          if (s.length >= 10) return s.slice(5, 10);
+          return s.slice(5) || '—';
+        });
+        const hi = daily.map(function (d) {
+          return d.tmax != null ? Number(d.tmax) : null;
+        });
+        const lo = daily.map(function (d) {
+          return d.tmin != null ? Number(d.tmin) : null;
+        });
+        forecastChart = new Chart(fcCanvas, {
+          type: 'line',
+          data: {
+            labels: labels,
+            datasets: [
+              {
+                label: '最高温 °C',
+                data: hi,
+                borderColor: '#ef4444',
+                backgroundColor: 'rgba(239, 68, 68, 0.08)',
+                fill: false,
+                tension: 0.25,
+                spanGaps: true,
+                pointRadius: 4,
+                pointHoverRadius: 6,
+                borderWidth: 2,
+              },
+              {
+                label: '最低温 °C',
+                data: lo,
+                borderColor: '#3b82f6',
+                backgroundColor: 'rgba(59, 130, 246, 0.08)',
+                fill: false,
+                tension: 0.25,
+                spanGaps: true,
+                pointRadius: 4,
+                pointHoverRadius: 6,
+                borderWidth: 2,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+              legend: { display: true, position: 'top' },
+              tooltip: {
+                callbacks: {
+                  afterBody: function (items) {
+                    const i = items[0] && items[0].dataIndex;
+                    if (i == null || !daily[i]) return '';
+                    const zh = daily[i].label_zh;
+                    return zh ? '天气：' + zh : '';
+                  },
+                },
+              },
+            },
+            scales: {
+              x: {
+                title: { display: true, text: '月-日' },
+                ticks: { maxRotation: 0 },
+              },
+              y: {
+                title: { display: true, text: '气温 °C' },
+                grace: '8%',
+              },
+            },
+          },
+        });
+      }
     } catch (e) {
       showErr(e.message || String(e));
       document.getElementById('heroDesc').textContent = '加载失败';

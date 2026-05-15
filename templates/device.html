@@ -8,7 +8,13 @@
 {% block content %}
 <div class="device-page">
   <h1>{{ device['name'] }}</h1>
-  <p class="lead">设备 ID <strong>{{ device['id'] }}</strong> · <a href="{{ url_for('index') }}" style="color:#fff;">← 返回首页</a></p>
+  <p class="lead">设备 ID <strong>{{ device['id'] }}</strong> · 所属用户 <strong>{{ owner_username }}</strong>
+    · <a href="{{ url_for('index') }}" style="color:#fff;">← 返回首页</a></p>
+  {% if viewing_others %}
+  <div class="card" style="background:#fffbeb;border:1px solid #fcd34d;margin-bottom:1rem;">
+    <strong>管理员提示：</strong>你正在查看<strong>其他用户</strong>的设备。在此页的改名、删除会直接影响该用户的数据。
+  </div>
+  {% endif %}
 
   <div class="card">
     <h2 style="margin-top:0;">连接信息</h2>
@@ -41,9 +47,26 @@
   </div>
 
   <div class="card">
-    <h2 style="margin-top:0;">最近读数曲线</h2>
-    <p class="hint">最多 120 条。无数据时不绘图。</p>
-    <canvas id="chart"></canvas>
+    <h2 style="margin-top:0;">近几日温度变化</h2>
+    <p class="hint">按自然日窗口从数据库取数（UTC 时间轴）；点很密时会自动抽样，避免卡顿。</p>
+    <div class="chart-toolbar" style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;margin-bottom:0.75rem;">
+      <span style="font-size:0.9rem;color:var(--muted);">时间范围：</span>
+      <button type="button" class="day-range-btn secondary" data-days="3">最近 3 天</button>
+      <button type="button" class="day-range-btn" data-days="7">最近 7 天</button>
+      <button type="button" class="day-range-btn secondary" data-days="14">最近 14 天</button>
+    </div>
+    <p id="chartDaysMsg" class="hint" style="display:none;margin:0 0 0.5rem;"></p>
+    <div style="position:relative;height:min(360px,55vh);">
+      <canvas id="chartDays"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0;">最近读数（温 / 湿 / 压）</h2>
+    <p class="hint">最近 120 条上报，便于看短期波动。</p>
+    <div style="position:relative;height:min(320px,50vh);">
+      <canvas id="chartRecent"></canvas>
+    </div>
   </div>
 
   <div class="card">
@@ -89,19 +112,110 @@
     if (res.ok) location.href = '/';
   }
 
-  (async function loadChart() {
+  let chartDays = null;
+  let chartRecent = null;
+
+  function downsampleRows(rows, maxPts) {
+    if (rows.length <= maxPts) return rows;
+    const step = Math.ceil(rows.length / maxPts);
+    const out = [];
+    for (let i = 0; i < rows.length; i += step) out.push(rows[i]);
+    if (out[out.length - 1] !== rows[rows.length - 1]) out.push(rows[rows.length - 1]);
+    return out;
+  }
+
+  async function loadChartDays(days) {
+    const msg = document.getElementById('chartDaysMsg');
+    const canvas = document.getElementById('chartDays');
+    msg.style.display = 'none';
+    msg.textContent = '';
+    if (chartDays) {
+      chartDays.destroy();
+      chartDays = null;
+    }
+    const res = await fetch('/api/devices/' + deviceId + '/readings?days=' + days + '&limit=2000', {
+      credentials: 'same-origin',
+    });
+    const raw = await res.json();
+    if (!Array.isArray(raw)) {
+      msg.textContent = '加载失败：' + (raw.error || String(res.status));
+      msg.style.display = 'block';
+      return;
+    }
+    const withTemp = raw.filter((r) => r.temperature !== null && r.temperature !== undefined);
+    if (!withTemp.length) {
+      msg.textContent = '该时段内没有温度数据。请确认设备已上报 temperature 字段。';
+      msg.style.display = 'block';
+      return;
+    }
+    const plot = downsampleRows(withTemp, 480);
+    if (plot.length < withTemp.length) {
+      msg.textContent = '点数较多，已抽样显示约 ' + plot.length + ' 个点（共 ' + withTemp.length + ' 条有温度）。';
+      msg.style.display = 'block';
+    }
+    const labels = plot.map((r) => (r.ts || '').replace('T', ' ').slice(0, 19));
+    const tData = plot.map((r) => r.temperature);
+    chartDays = new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: '温度 °C',
+            data: tData,
+            borderColor: '#f87171',
+            backgroundColor: 'rgba(248, 113, 113, 0.12)',
+            fill: true,
+            tension: 0.15,
+            spanGaps: false,
+            pointRadius: plot.length > 120 ? 0 : 2,
+            pointHoverRadius: 4,
+            borderWidth: 2,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: true },
+          tooltip: {
+            callbacks: {
+              title: (items) => (items[0] && items[0].label) || '',
+            },
+          },
+        },
+        scales: {
+          x: {
+            ticks: { maxRotation: 45, minRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+          },
+          y: {
+            title: { display: true, text: '°C' },
+            grace: '5%',
+          },
+        },
+      },
+    });
+  }
+
+  async function loadChartRecent() {
+    const canvas = document.getElementById('chartRecent');
     const res = await fetch('/api/devices/' + deviceId + '/readings?limit=120', {
       credentials: 'same-origin',
     });
     const rows = await res.json();
-    if (!rows.length) return;
-    rows.reverse();
-    const labels = rows.map(r => (r.ts || '').replace('T', ' ').slice(0, 19));
-    const tData = rows.map(r => r.temperature);
-    const hData = rows.map(r => r.humidity);
-    const pData = rows.map(r => r.pressure);
-    const ctx = document.getElementById('chart');
-    new Chart(ctx, {
+    if (!Array.isArray(rows) || !rows.length) return;
+    if (chartRecent) {
+      chartRecent.destroy();
+      chartRecent = null;
+    }
+    const chronological = rows.slice().reverse();
+    const labels = chronological.map((r) => (r.ts || '').replace('T', ' ').slice(0, 19));
+    const tData = chronological.map((r) => r.temperature);
+    const hData = chronological.map((r) => r.humidity);
+    const pData = chronological.map((r) => r.pressure);
+    chartRecent = new Chart(canvas, {
       type: 'line',
       data: {
         labels,
@@ -113,6 +227,7 @@
       },
       options: {
         responsive: true,
+        maintainAspectRatio: false,
         interaction: { mode: 'index', intersect: false },
         scales: {
           x: { ticks: { maxRotation: 45, minRotation: 0 } },
@@ -125,6 +240,23 @@
         },
       },
     });
-  })();
+  }
+
+  document.querySelectorAll('.day-range-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const d = parseInt(btn.getAttribute('data-days'), 10);
+      document.querySelectorAll('.day-range-btn').forEach((b) => b.classList.add('secondary'));
+      btn.classList.remove('secondary');
+      loadChartDays(d);
+    });
+  });
+
+  const defaultBtn = document.querySelector('.day-range-btn[data-days="7"]');
+  if (defaultBtn) defaultBtn.classList.remove('secondary');
+  document.querySelectorAll('.day-range-btn').forEach((b) => {
+    if (b !== defaultBtn) b.classList.add('secondary');
+  });
+  loadChartDays(7);
+  loadChartRecent();
 </script>
 {% endblock %}
